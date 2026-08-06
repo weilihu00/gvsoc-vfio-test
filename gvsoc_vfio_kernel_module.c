@@ -92,6 +92,7 @@ struct vfio_bridge_bar0_write32 {
 #define VFIO_BRIDGE_IOC_GET_INFO  _IOR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
 #define VFIO_BRIDGE_IOC_SUBMIT    _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x02, struct vfio_bridge_dma_submit)
 #define VFIO_BRIDGE_IOC_BAR0_WRITE32 _IOW(VFIO_BRIDGE_IOC_MAGIC, 0x03, struct vfio_bridge_bar0_write32)
+#define VFIO_BRIDGE_IOC_WAIT_EOC _IO(VFIO_BRIDGE_IOC_MAGIC, 0x04)
 
 struct vfio_bridge_dev {
     struct pci_dev *pdev;
@@ -103,7 +104,9 @@ struct vfio_bridge_dev {
     size_t dma_size;
 
     int irq_vector;
+    int irq_eoc;
     struct completion dma_done;
+    struct completion eoc_done;
     struct mutex lock;
 
     u32 last_status;
@@ -142,6 +145,15 @@ static irqreturn_t vfio_bridge_irq_handler(int irq, void *data)
     d->last_error  = vfio_bridge_bar0_read32(d, BAR0_DMA_ERROR);
 
     complete(&d->dma_done);
+    return IRQ_HANDLED;
+}
+
+static irqreturn_t vfio_bridge_eoc_handler(int irq, void *data)
+{
+    struct vfio_bridge_dev *d = data;
+
+    complete(&d->eoc_done);
+
     return IRQ_HANDLED;
 }
 
@@ -257,6 +269,16 @@ static long vfio_bridge_unlocked_ioctl(struct file *filp, unsigned int cmd, unsi
         mutex_unlock(&d->lock);
         return 0;
     }
+    case VFIO_BRIDGE_IOC_WAIT_EOC:
+    {
+        long ret;
+
+        reinit_completion(&d->eoc_done);
+
+        ret = wait_for_completion_interruptible(&d->eoc_done);
+
+        return ret;
+    }
     default:
         return -ENOTTY;
     }
@@ -299,6 +321,7 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     d->dma_size = DMA_BUFFER_SIZE;
     mutex_init(&d->lock);
     init_completion(&d->dma_done);
+    init_completion(&d->eoc_done);
 
     pci_set_drvdata(pdev, d);
 
@@ -332,7 +355,7 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     if (!d->dma_cpu_addr)
         return -ENOMEM;
 
-    ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX);
+    ret = pci_alloc_irq_vectors(pdev, 2, 2, PCI_IRQ_MSIX);
     if (ret < 0) {
         dev_err(&pdev->dev, "pci_alloc_irq_vectors(MSI-X) failed: %d\n", ret);
         goto err_free_dma;
@@ -343,6 +366,13 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     if (ret) {
         dev_err(&pdev->dev, "request_irq failed: %d\n", ret);
         goto err_free_vectors;
+    }
+
+    d->irq_eoc = pci_irq_vector(pdev, 1);
+    ret = request_irq(d->irq_eoc, vfio_bridge_eoc_handler, 0, DRV_NAME, d);
+    if (ret) {
+        dev_err(&pdev->dev, "request_irq failed: %d\n", ret);
+        goto err_free_vectors_eoc;
     }
 
     d->miscdev.minor = MISC_DYNAMIC_MINOR;
@@ -364,6 +394,8 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     return 0;
 
 err_free_irq:
+    free_irq(d->irq_eoc, d);
+err_free_vectors_eoc:
     free_irq(d->irq_vector, d);
 err_free_vectors:
     pci_free_irq_vectors(pdev);
@@ -378,6 +410,7 @@ static void vfio_bridge_remove(struct pci_dev *pdev)
 
     misc_deregister(&d->miscdev);
     free_irq(d->irq_vector, d);
+    free_irq(d->irq_eoc, d);
     pci_free_irq_vectors(pdev);
     dma_free_coherent(&pdev->dev, d->dma_size, d->dma_cpu_addr, d->dma_handle);
 }
