@@ -42,7 +42,7 @@
 #define VFIO_BRIDGE_DEVICE_ID 0x0001
 #endif
 
-/* BAR0 registers */
+/* DMA channel 0 */
 #define BAR0_DMA_SRC_ADDR_LO 0x00
 #define BAR0_DMA_SRC_ADDR_HI 0x04
 #define BAR0_DMA_DST_ADDR_LO 0x08
@@ -53,8 +53,24 @@
 #define BAR0_DMA_ERROR       0x1c
 #define BAR0_DMA_MAGIC       0x20
 #define BAR0_DMA_DIRECTION   0x24
+
+/* BAR0 registers global */
 #define BAR0_ENTRY_POINT     0x28
 #define BAR0_FETCH_ENABLE    0x2C
+
+/* DMA channel 1 */
+#define BAR0_DMA1_SRC_ADDR_LO 0x90
+#define BAR0_DMA1_SRC_ADDR_HI 0x94
+#define BAR0_DMA1_DST_ADDR_LO 0x98
+#define BAR0_DMA1_DST_ADDR_HI 0x9C
+#define BAR0_DMA1_LEN         0xA0
+#define BAR0_DMA1_CTRL        0xA4
+#define BAR0_DMA1_STATUS      0xA8
+#define BAR0_DMA1_ERROR       0xAC
+#define BAR0_DMA1_MAGIC       0xB0
+#define BAR0_DMA1_DIRECTION   0xB4
+
+#define DMA_CHANNELS 2
 
 #define DMA_CTRL_START   BIT(0)
 #define DMA_CTRL_ABORT   BIT(1)
@@ -70,7 +86,7 @@
 struct vfio_bridge_dma_info {
     __u64 dma_addr;
     __u32 size;
-    __u32 reserved;
+    __u32 channel;
 };
 
 struct vfio_bridge_dma_submit {
@@ -80,7 +96,7 @@ struct vfio_bridge_dma_submit {
     __u32 len;
     __u32 status;
     __u32 error;
-    __u32 reserved;
+    __u32 channel;
 };
 
 struct vfio_bridge_bar0_write32 {
@@ -89,28 +105,36 @@ struct vfio_bridge_bar0_write32 {
 };
 
 #define VFIO_BRIDGE_IOC_MAGIC     'V'
-#define VFIO_BRIDGE_IOC_GET_INFO  _IOR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
+#define VFIO_BRIDGE_IOC_GET_INFO  _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x01, struct vfio_bridge_dma_info)
 #define VFIO_BRIDGE_IOC_SUBMIT    _IOWR(VFIO_BRIDGE_IOC_MAGIC, 0x02, struct vfio_bridge_dma_submit)
 #define VFIO_BRIDGE_IOC_BAR0_WRITE32 _IOW(VFIO_BRIDGE_IOC_MAGIC, 0x03, struct vfio_bridge_bar0_write32)
 #define VFIO_BRIDGE_IOC_WAIT_EOC _IO(VFIO_BRIDGE_IOC_MAGIC, 0x04)
+
+struct vfio_bridge_dma_channel {
+    void *dma_cpu_addr;
+    dma_addr_t dma_handle;
+    size_t dma_size;
+
+    struct completion dma_done;
+    struct mutex lock;
+
+    u32 last_status;
+    u32 last_error;
+};
 
 struct vfio_bridge_dev {
     struct pci_dev *pdev;
     void __iomem *bar0;
     resource_size_t bar0_len;
 
-    void *dma_cpu_addr;
-    dma_addr_t dma_handle;
-    size_t dma_size;
+    struct vfio_bridge_dma_channel dma[DMA_CHANNELS];
 
     int irq_vector;
     int irq_eoc;
-    struct completion dma_done;
-    struct completion eoc_done;
-    struct mutex lock;
 
-    u32 last_status;
-    u32 last_error;
+    struct completion eoc_done;
+
+    struct mutex lock;
 
     struct miscdevice miscdev;
 };
@@ -141,10 +165,22 @@ static irqreturn_t vfio_bridge_irq_handler(int irq, void *data)
 {
     struct vfio_bridge_dev *d = data;
 
-    d->last_status = vfio_bridge_bar0_read32(d, BAR0_DMA_STATUS);
-    d->last_error  = vfio_bridge_bar0_read32(d, BAR0_DMA_ERROR);
+    d->dma[0].last_status =
+        vfio_bridge_bar0_read32(d, BAR0_DMA_STATUS);
+    d->dma[0].last_error =
+        vfio_bridge_bar0_read32(d, BAR0_DMA_ERROR);
 
-    complete(&d->dma_done);
+    if (d->dma[0].last_status & DMA_STATUS_DONE)
+        complete(&d->dma[0].dma_done);
+
+    d->dma[1].last_status =
+        vfio_bridge_bar0_read32(d, BAR0_DMA1_STATUS);
+    d->dma[1].last_error =
+        vfio_bridge_bar0_read32(d, BAR0_DMA1_ERROR);
+
+    if (d->dma[1].last_status & DMA_STATUS_DONE)
+        complete(&d->dma[1].dma_done);
+
     return IRQ_HANDLED;
 }
 
@@ -160,51 +196,63 @@ static irqreturn_t vfio_bridge_eoc_handler(int irq, void *data)
 static int vfio_bridge_submit_dma(struct vfio_bridge_dev *d,
                                   struct vfio_bridge_dma_submit *req)
 {
+    struct vfio_bridge_dma_channel *dma;
     unsigned long timeout_jiffies;
     unsigned long wait_ret;
+    u32 base;
     u32 ctrl;
+
+    if (req->channel >= DMA_CHANNELS)
+        return -EINVAL;
 
     if (req->direction != DMA_DIR_HOST_TO_CARD &&
         req->direction != DMA_DIR_CARD_TO_HOST)
         return -EINVAL;
 
-    if (req->len == 0 || req->len > d->dma_size)
+    dma = &d->dma[req->channel];
+    base = (req->channel == 0) ?
+           BAR0_DMA_SRC_ADDR_LO : BAR0_DMA1_SRC_ADDR_LO;
+
+    if (req->len == 0 || req->len > dma->dma_size)
         return -EINVAL;
 
-    mutex_lock(&d->lock);
+    mutex_lock(&dma->lock);
 
-    reinit_completion(&d->dma_done);
-    d->last_status = 0;
-    d->last_error = 0;
+    vfio_bridge_bar0_write32(d, base + 0x18, 0);
+    vfio_bridge_bar0_write32(d, base + 0x1C, 0);
+
+    reinit_completion(&dma->dma_done);
+    dma->last_status = 0;
+    dma->last_error = 0;
 
     if (req->direction == DMA_DIR_HOST_TO_CARD) {
-        vfio_bridge_bar0_write64(d, BAR0_DMA_SRC_ADDR_LO, (u64)d->dma_handle);
-        vfio_bridge_bar0_write64(d, BAR0_DMA_DST_ADDR_LO, req->device_addr);
+        vfio_bridge_bar0_write64(d, base, (u64)dma->dma_handle);
+        vfio_bridge_bar0_write64(d, base + 0x08, req->device_addr);
     } else {
-        vfio_bridge_bar0_write64(d, BAR0_DMA_SRC_ADDR_LO, req->device_addr);
-        vfio_bridge_bar0_write64(d, BAR0_DMA_DST_ADDR_LO, (u64)d->dma_handle);
+        vfio_bridge_bar0_write64(d, base, req->device_addr);
+        vfio_bridge_bar0_write64(d, base + 0x08, (u64)dma->dma_handle);
     }
 
-    vfio_bridge_bar0_write32(d, BAR0_DMA_LEN, req->len);
-    vfio_bridge_bar0_write32(d, BAR0_DMA_DIRECTION, req->direction);
+    vfio_bridge_bar0_write32(d, base + 0x10, req->len);
+    vfio_bridge_bar0_write32(d, base + 0x24, req->direction);
 
     ctrl = DMA_CTRL_START | DMA_CTRL_IRQ_EN;
-    vfio_bridge_bar0_write32(d, BAR0_DMA_CTRL, ctrl);
+    vfio_bridge_bar0_write32(d, base + 0x14, ctrl);
 
     timeout_jiffies = msecs_to_jiffies(req->timeout_ms ? req->timeout_ms : DMA_TIMEOUT_MS);
-    wait_ret = wait_for_completion_timeout(&d->dma_done, timeout_jiffies);
+    wait_ret = wait_for_completion_timeout(&dma->dma_done, timeout_jiffies);
 
     if (wait_ret == 0) {
-        req->status = vfio_bridge_bar0_read32(d, BAR0_DMA_STATUS);
-        req->error  = vfio_bridge_bar0_read32(d, BAR0_DMA_ERROR);
-        mutex_unlock(&d->lock);
+        req->status = vfio_bridge_bar0_read32(d, base + 0x18);
+        req->error  = vfio_bridge_bar0_read32(d, base + 0x1C);
+        mutex_unlock(&dma->lock);
         return -ETIMEDOUT;
     }
 
-    req->status = d->last_status;
-    req->error  = d->last_error;
+    req->status = dma->last_status;
+    req->error  = dma->last_error;
 
-    mutex_unlock(&d->lock);
+    mutex_unlock(&dma->lock);
 
     return (req->status & DMA_STATUS_ERROR) ? -EIO : 0;
 }
@@ -227,9 +275,14 @@ static long vfio_bridge_unlocked_ioctl(struct file *filp, unsigned int cmd, unsi
     {
         struct vfio_bridge_dma_info info;
 
-        info.dma_addr = (u64)d->dma_handle;
-        info.size = d->dma_size;
-        info.reserved = 0;
+        if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
+            return -EFAULT;
+
+        if (info.channel >= DMA_CHANNELS)
+            return -EINVAL;
+
+        info.dma_addr = (u64)d->dma[info.channel].dma_handle;
+        info.size = d->dma[info.channel].dma_size;
 
         if (copy_to_user((void __user *)arg, &info, sizeof(info)))
             return -EFAULT;
@@ -287,13 +340,22 @@ static long vfio_bridge_unlocked_ioctl(struct file *filp, unsigned int cmd, unsi
 static int vfio_bridge_mmap(struct file *filp, struct vm_area_struct *vma)
 {
     struct vfio_bridge_dev *d = filp->private_data;
+    struct vfio_bridge_dma_channel *dma;
     unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long channel = vma->vm_pgoff;
 
-    if (size > d->dma_size)
+    if (channel >= DMA_CHANNELS)
         return -EINVAL;
 
+    dma = &d->dma[channel];
+
+    if (size > dma->dma_size)
+        return -EINVAL;
+
+    vma->vm_pgoff = 0;
+
     return dma_mmap_coherent(&d->pdev->dev, vma,
-                             d->dma_cpu_addr, d->dma_handle, d->dma_size);
+                             dma->dma_cpu_addr, dma->dma_handle, dma->dma_size);
 }
 
 static const struct file_operations vfio_bridge_fops = {
@@ -311,17 +373,21 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
 {
     struct vfio_bridge_dev *d;
     int ret;
+    int i;
     u32 magic;
-
+    
     d = devm_kzalloc(&pdev->dev, sizeof(*d), GFP_KERNEL);
     if (!d)
         return -ENOMEM;
 
     d->pdev = pdev;
-    d->dma_size = DMA_BUFFER_SIZE;
     mutex_init(&d->lock);
-    init_completion(&d->dma_done);
     init_completion(&d->eoc_done);
+    for (i = 0; i < DMA_CHANNELS; i++) {
+        d->dma[i].dma_size = DMA_BUFFER_SIZE;
+        mutex_init(&d->dma[i].lock);
+        init_completion(&d->dma[i].dma_done);
+    }
 
     pci_set_drvdata(pdev, d);
 
@@ -350,10 +416,15 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     magic = vfio_bridge_bar0_read32(d, BAR0_DMA_MAGIC);
     dev_info(&pdev->dev, "BAR0 DMA magic = 0x%x\n", magic);
 
-    d->dma_cpu_addr = dma_alloc_coherent(&pdev->dev, d->dma_size,
-                                         &d->dma_handle, GFP_KERNEL);
-    if (!d->dma_cpu_addr)
-        return -ENOMEM;
+    for (i = 0; i < DMA_CHANNELS; i++) {
+        d->dma[i].dma_cpu_addr =
+            dma_alloc_coherent(&pdev->dev, d->dma[i].dma_size, &d->dma[i].dma_handle, GFP_KERNEL);
+
+        if (!d->dma[i].dma_cpu_addr) {
+            ret = -ENOMEM;
+            goto err_free_dma;
+        }
+    }
 
     ret = pci_alloc_irq_vectors(pdev, 2, 2, PCI_IRQ_MSIX);
     if (ret < 0) {
@@ -387,9 +458,8 @@ static int vfio_bridge_probe(struct pci_dev *pdev, const struct pci_device_id *i
     }
 
     dev_info(&pdev->dev,
-             "probed: /dev/%s dma_handle=0x%llx size=%zu irq=%d\n",
-             DEV_NAME, (unsigned long long)d->dma_handle,
-             d->dma_size, d->irq_vector);
+         "probed: /dev/%s irq=%d\n",
+         DEV_NAME, d->irq_vector);
 
     return 0;
 
@@ -400,19 +470,35 @@ err_free_vectors_eoc:
 err_free_vectors:
     pci_free_irq_vectors(pdev);
 err_free_dma:
-    dma_free_coherent(&pdev->dev, d->dma_size, d->dma_cpu_addr, d->dma_handle);
+    for (i = 0; i < DMA_CHANNELS; i++) {
+        if (d->dma[i].dma_cpu_addr) {
+            dma_free_coherent( &pdev->dev, d->dma[i].dma_size, d->dma[i].dma_cpu_addr, d->dma[i].dma_handle);
+
+            d->dma[i].dma_cpu_addr = NULL;
+        }
+    }
+
     return ret;
 }
 
 static void vfio_bridge_remove(struct pci_dev *pdev)
 {
     struct vfio_bridge_dev *d = pci_get_drvdata(pdev);
+    int i;
 
     misc_deregister(&d->miscdev);
+
     free_irq(d->irq_vector, d);
     free_irq(d->irq_eoc, d);
     pci_free_irq_vectors(pdev);
-    dma_free_coherent(&pdev->dev, d->dma_size, d->dma_cpu_addr, d->dma_handle);
+
+    for (i = 0; i < DMA_CHANNELS; i++) {
+        if (d->dma[i].dma_cpu_addr) {
+            dma_free_coherent(&pdev->dev, d->dma[i].dma_size, d->dma[i].dma_cpu_addr, d->dma[i].dma_handle);
+
+            d->dma[i].dma_cpu_addr = NULL;
+        }
+    }
 }
 
 static struct pci_driver vfio_bridge_pci_driver = {
